@@ -16,6 +16,7 @@ extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "cuda_compat.h"
 #include "dispatch_utils.h"
@@ -37,12 +38,15 @@ template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&),
 __global__ void act_and_mul_kernel(
     scalar_t* __restrict__ out,          // [..., d]
     const scalar_t* __restrict__ input,  // [..., 2, d]
-    const int d) {
+    const int d, const int64_t in_row_stride) {
   const int64_t token_idx = blockIdx.x;
+  const int64_t in_base = token_idx * in_row_stride;
+  const int64_t out_base = token_idx * static_cast<int64_t>(d);
   for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
-    const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
-    const scalar_t y = VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
-    out[token_idx * d + idx] = compute<scalar_t, ACT_FN, act_first>(x, y);
+    const scalar_t x = VLLM_LDG(&input[in_base + idx]);
+    const scalar_t y =
+        VLLM_LDG(&input[in_base + static_cast<int64_t>(d) + idx]);
+    out[out_base + idx] = compute<scalar_t, ACT_FN, act_first>(x, y);
   }
 }
 
@@ -77,12 +81,64 @@ __device__ __forceinline__ T gelu_tanh_kernel(const T& x) {
 
 }  // namespace vllm
 
+// Row stride, in elements, of a tensor viewed as (num_rows, size(-1)).
+//
+// Contiguous inputs keep the packed stride and never call this. The supported
+// non-contiguous layout is a contiguous last dimension whose leading
+// dimensions collapse to one row stride, such as chunk() on the last dim.
+// A negative stride, or a gap that is not a single row stride, is rejected.
+static int64_t activation_row_stride(const Tensor& input) {
+  const int64_t nd = input.dim();
+  STD_TORCH_CHECK(nd >= 1, "activation input must have at least 1 dimension");
+  const int64_t cols = input.size(nd - 1);
+  if (cols > 1) {
+    STD_TORCH_CHECK(input.stride(nd - 1) == 1,
+                    "activation input last dimension must be contiguous, got "
+                    "stride ",
+                    input.stride(nd - 1));
+  }
+  if (nd == 1) {
+    return cols;
+  }
+  int64_t row_stride = 0;
+  int64_t inner = 1;
+  bool found = false;
+  for (int64_t i = nd - 2; i >= 0; --i) {
+    const int64_t sz = input.size(i);
+    if (sz == 1) {
+      continue;
+    }
+    const int64_t stride_i = input.stride(i);
+    STD_TORCH_CHECK(
+        stride_i >= 0,
+        "activation input last dimension must be contiguous and row strides "
+        "must be non-negative");
+    if (!found) {
+      row_stride = stride_i;
+      inner = sz;
+      found = true;
+      continue;
+    }
+    STD_TORCH_CHECK(
+        inner > 0 && row_stride <= std::numeric_limits<int64_t>::max() / inner &&
+            stride_i == row_stride * inner,
+        "activation input leading dimensions must form a single row stride");
+    STD_TORCH_CHECK(sz <= std::numeric_limits<int64_t>::max() / inner,
+                    "activation input row stride overflow");
+    inner *= sz;
+  }
+  return found ? row_stride : cols;
+}
+
 // Launch activation and gating kernel.
 // Use ACT_FIRST (bool) indicating whether to apply the activation function
 // first.
 #define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL, ACT_FIRST)                       \
   int d = input.size(-1) / 2;                                                  \
   int64_t num_tokens = input.numel() / input.size(-1);                        \
+  const int64_t in_row_stride =                                                \
+      input.is_contiguous() ? static_cast<int64_t>(d) * 2                      \
+                            : activation_row_stride(input);                    \
   dim3 grid(num_tokens);                                                       \
   dim3 block(std::min(d, 1024));                                               \
   if (num_tokens == 0) {                                                       \
@@ -99,13 +155,13 @@ __device__ __forceinline__ T gelu_tanh_kernel(const T& x) {
         vllm::act_and_mul_kernel<scalar_t, KERNEL<scalar_t>, ACT_FIRST>       \
             <<<grid, block, 0, stream>>>(                                      \
                 static_cast<scalar_t*>(out.data_ptr()),                        \
-                static_cast<const scalar_t*>(input.data_ptr()), d);           \
+                static_cast<const scalar_t*>(input.data_ptr()), d,            \
+                in_row_stride);                                                \
       });
 
 void silu_and_mul(Tensor& out,          // [..., d]
                   Tensor const& input)  // [..., 2 * d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, true);
 }
@@ -115,7 +171,6 @@ void mul_and_silu(Tensor& out,          // [..., d]
 {
   // The difference between mul_and_silu and silu_and_mul is that mul_and_silu
   // applies the silu to the latter half of the input.
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, false);
 }
@@ -123,7 +178,6 @@ void mul_and_silu(Tensor& out,          // [..., d]
 void gelu_and_mul(Tensor& out,          // [..., d]
                   Tensor const& input)  // [..., 2 * d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_kernel, true);
 }
@@ -131,7 +185,6 @@ void gelu_and_mul(Tensor& out,          // [..., d]
 void gelu_tanh_and_mul(Tensor& out,          // [..., d]
                        Tensor const& input)  // [..., 2 * d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel, true);
 }
@@ -147,12 +200,15 @@ __device__ __forceinline__ T fatrelu_kernel(const T& x, const float threshold) {
 template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&, const float)>
 __global__ void act_and_mul_kernel_with_param(
     scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const int d,
-    const float param) {
+    const float param, const int64_t in_row_stride) {
   const int64_t token_idx = blockIdx.x;
+  const int64_t in_base = token_idx * in_row_stride;
+  const int64_t out_base = token_idx * static_cast<int64_t>(d);
   for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
-    const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
-    const scalar_t y = VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
-    out[token_idx * d + idx] = ACT_FN(x, param) * y;
+    const scalar_t x = VLLM_LDG(&input[in_base + idx]);
+    const scalar_t y =
+        VLLM_LDG(&input[in_base + static_cast<int64_t>(d) + idx]);
+    out[out_base + idx] = ACT_FN(x, param) * y;
   }
 }
 
@@ -161,8 +217,14 @@ __global__ void act_and_mul_kernel_with_param(
 #define LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(KERNEL, PARAM)               \
   int d = input.size(-1) / 2;                                                 \
   int64_t num_tokens = input.numel() / input.size(-1);                       \
+  const int64_t in_row_stride =                                               \
+      input.is_contiguous() ? static_cast<int64_t>(d) * 2                     \
+                            : activation_row_stride(input);                   \
   dim3 grid(num_tokens);                                                      \
   dim3 block(std::min(d, 1024));                                              \
+  if (num_tokens == 0) {                                                      \
+    return;                                                                   \
+  }                                                                           \
   const torch::stable::accelerator::DeviceGuard device_guard(                 \
       input.get_device_index());                                             \
   void* stream_ptr = nullptr;                                                 \
@@ -174,13 +236,13 @@ __global__ void act_and_mul_kernel_with_param(
         vllm::act_and_mul_kernel_with_param<scalar_t, KERNEL<scalar_t>>      \
             <<<grid, block, 0, stream>>>(                                     \
                 static_cast<scalar_t*>(out.data_ptr()),                       \
-                static_cast<const scalar_t*>(input.data_ptr()), d, PARAM);   \
+                static_cast<const scalar_t*>(input.data_ptr()), d, PARAM,    \
+                in_row_stride);                                               \
       });
 
 void fatrelu_and_mul(Tensor& out,          // [..., d],
                      Tensor const& input,  // [..., 2 * d]
                      double threshold) {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(vllm::fatrelu_kernel, threshold);
 }
@@ -191,11 +253,13 @@ template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&)>
 __global__ void activation_kernel(
     scalar_t* __restrict__ out,          // [..., d]
     const scalar_t* __restrict__ input,  // [..., d]
-    const int d) {
+    const int d, const int64_t in_row_stride) {
   const int64_t token_idx = blockIdx.x;
+  const int64_t in_base = token_idx * in_row_stride;
+  const int64_t out_base = token_idx * static_cast<int64_t>(d);
   for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
-    const scalar_t x = VLLM_LDG(&input[token_idx * d + idx]);
-    out[token_idx * d + idx] = ACT_FN(x);
+    const scalar_t x = VLLM_LDG(&input[in_base + idx]);
+    out[out_base + idx] = ACT_FN(x);
   }
 }
 
@@ -205,8 +269,14 @@ __global__ void activation_kernel(
 #define LAUNCH_ACTIVATION_KERNEL(KERNEL)                                     \
   int d = input.size(-1);                                                    \
   int64_t num_tokens = input.numel() / d;                                    \
+  const int64_t in_row_stride =                                              \
+      input.is_contiguous() ? static_cast<int64_t>(d)                        \
+                            : activation_row_stride(input);                  \
   dim3 grid(num_tokens);                                                     \
   dim3 block(std::min(d, 1024));                                             \
+  if (num_tokens == 0) {                                                     \
+    return;                                                                  \
+  }                                                                          \
   const torch::stable::accelerator::DeviceGuard device_guard(               \
       input.get_device_index());                                            \
   void* stream_ptr = nullptr;                                                \
@@ -218,7 +288,8 @@ __global__ void activation_kernel(
         vllm::activation_kernel<scalar_t, KERNEL<scalar_t>>                 \
             <<<grid, block, 0, stream>>>(                                    \
                 static_cast<scalar_t*>(out.data_ptr()),                      \
-                static_cast<const scalar_t*>(input.data_ptr()), d);         \
+                static_cast<const scalar_t*>(input.data_ptr()), d,          \
+                in_row_stride);                                              \
       });
 
 namespace vllm {
@@ -250,7 +321,6 @@ __device__ __forceinline__ T gelu_quick_kernel(const T& x) {
 void gelu_new(Tensor& out,          // [..., d]
               Tensor const& input)  // [..., d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_new_kernel);
 }
@@ -258,7 +328,6 @@ void gelu_new(Tensor& out,          // [..., d]
 void gelu_fast(Tensor& out,          // [..., d]
                Tensor const& input)  // [..., d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_fast_kernel);
 }
@@ -266,7 +335,6 @@ void gelu_fast(Tensor& out,          // [..., d]
 void gelu_quick(Tensor& out,          // [..., d]
                 Tensor const& input)  // [..., d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_quick_kernel);
 }
@@ -274,7 +342,6 @@ void gelu_quick(Tensor& out,          // [..., d]
 void gelu(Tensor& out,          // [..., d]
           Tensor const& input)  // [..., d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_kernel);
 }
@@ -282,7 +349,6 @@ void gelu(Tensor& out,          // [..., d]
 void gelu_tanh(Tensor& out,          // [..., d]
                Tensor const& input)  // [..., d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_tanh_kernel);
 }
@@ -290,7 +356,6 @@ void gelu_tanh(Tensor& out,          // [..., d]
 void silu(Tensor& out,          // [..., d]
           Tensor const& input)  // [..., d]
 {
-  STD_TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   LAUNCH_ACTIVATION_KERNEL(vllm::silu_kernel);
 }

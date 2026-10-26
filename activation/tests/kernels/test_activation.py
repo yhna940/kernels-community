@@ -26,12 +26,38 @@ def _devices() -> list[str]:
         name, count = "xpu", torch.xpu.device_count()
     elif torch.cuda.is_available():
         name, count = "cuda", torch.cuda.device_count()
+    elif torch.backends.mps.is_available():
+        return ["mps"]
     else:
         return ["cpu"]
     return [f"{name}:{i}" for i in range(1 if count == 1 else 2)]
 
 
 DEVICES = _devices()
+
+
+def _skip_unsupported_dtype(dtype: torch.dtype, device: str) -> None:
+    # Metal instantiates fp16 and fp32 only. bf16 still runs on CUDA and XPU.
+    if torch.device(device).type == "mps" and dtype == torch.bfloat16:
+        pytest.skip("Metal activation kernels implement float16 and float32 only")
+
+
+def _assert_reference(out: torch.Tensor, ref: torch.Tensor, *, exact: bool = False) -> None:
+    # CUDA matches the reference bit for bit. Metal rounds a fp32 evaluation
+    # back to fp16, so MPS uses the usual dtype tolerances.
+    if exact and out.device.type != "mps":
+        torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
+        return
+    torch.testing.assert_close(
+        out, ref, atol=get_default_atol(out), rtol=get_default_rtol(out)
+    )
+
+
+def _maybe_opcheck(op, args, device: str) -> None:
+    # opcheck's schema test upcasts to float64, which MPS does not implement.
+    if torch.device(device).type == "mps":
+        return
+    opcheck(op, args)
 
 
 def gelu_fast(x: torch.Tensor) -> torch.Tensor:
@@ -89,6 +115,7 @@ def act_and_mul_check(
     seed: int,
     device: str,
 ) -> None:
+    _skip_unsupported_dtype(dtype, device)
     random.seed(seed)
     torch.manual_seed(seed)
     torch.set_default_device(device)
@@ -127,17 +154,17 @@ def act_and_mul_check(
     ref_out = torch_fn(x)
 
     # The SiLU, GELU and FatReLU implementations are equivalent to the native
-    # PyTorch implementations, so we can do exact comparison.
-    torch.testing.assert_close(out, ref_out, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(mod_out, ref_out, atol=0.0, rtol=0.0)
+    # PyTorch implementations, so CUDA can do an exact comparison.
+    _assert_reference(out, ref_out, exact=True)
+    _assert_reference(mod_out, ref_out, exact=True)
 
     d = x.shape[-1] // 2
     output_shape = x.shape[:-1] + (d,)
     out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
     if activation_name == "fatrelu":
-        opcheck(op, (out, x, threshold))
+        _maybe_opcheck(op, (out, x, threshold), device)
     else:
-        opcheck(op, (out, x))
+        _maybe_opcheck(op, (out, x), device)
 
 
 @pytest.mark.parametrize("activation_name", ACT_AND_MUL_NAMES)
@@ -220,6 +247,7 @@ def activation_check(
     seed: int,
     device: str,
 ) -> None:
+    _skip_unsupported_dtype(dtype, device)
     torch.manual_seed(seed)
     torch.set_default_device(device)
     x = torch.randn(num_tokens, d, dtype=dtype)
@@ -228,15 +256,11 @@ def activation_check(
     out = fn(torch.empty_like(x), x)
     layer_out = layer(x)
     ref_out = torch_fn(x)
-    torch.testing.assert_close(
-        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
-    )
-    torch.testing.assert_close(
-        out, layer_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
-    )
+    _assert_reference(out, ref_out)
+    _assert_reference(out, layer_out)
 
     out = torch.empty_like(x)
-    opcheck(op, (out, x))
+    _maybe_opcheck(op, (out, x), device)
 
 
 @pytest.mark.parametrize("activation_fns", ACTIVATION_FNS)
@@ -278,6 +302,7 @@ def test_activation_ci(activation_fns) -> None:
 @pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
 def test_act_and_mul_unaligned(d: int, dtype: torch.dtype, device: str) -> None:
+    _skip_unsupported_dtype(dtype, device)
     torch.manual_seed(0)
     torch.set_default_device(device)
     num_tokens = 5
@@ -287,15 +312,126 @@ def test_act_and_mul_unaligned(d: int, dtype: torch.dtype, device: str) -> None:
     out = torch.empty(num_tokens, d, dtype=dtype)
     out = activation.silu_and_mul(out, x)
 
-    torch.testing.assert_close(out, silu_and_mul(x), atol=0.0, rtol=0.0)
+    _assert_reference(out, silu_and_mul(x), exact=True)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
 def test_empty_input(dtype: torch.dtype, device: str) -> None:
+    _skip_unsupported_dtype(dtype, device)
     torch.set_default_device(device)
     x = torch.empty(0, 128, dtype=dtype)
 
     assert activation.silu_and_mul(torch.empty(0, 64, dtype=dtype), x).shape == (0, 64)
     assert activation.silu(torch.empty(0, 128, dtype=dtype), x).shape == (0, 128)
+
+
+# Elementwise ops exercised on the non-contiguous halves of a last-dim chunk,
+# which is how ModernBERT and GraniteMoE feed the activation.
+_CHUNK_ACTIVATIONS = [
+    ("silu", silu, activation.silu, activation.layers.Silu),
+    ("gelu", gelu, activation.gelu, activation.layers.Gelu),
+    ("gelu_tanh", gelu_tanh, activation.gelu_tanh, activation.layers.GeluTanh),
+    ("gelu_fast", gelu_fast, activation.gelu_fast, activation.layers.FastGELU),
+    ("gelu_new", gelu_new, activation.gelu_new, activation.layers.NewGELU),
+    ("gelu_quick", gelu_quick, activation.gelu_quick, activation.layers.QuickGELU),
+]
+
+
+def _assert_activation_close(out: torch.Tensor, ref: torch.Tensor) -> None:
+    _assert_reference(out, ref)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("hidden", [13, 64])
+@pytest.mark.parametrize("half", ["leading", "trailing"])
+@pytest.mark.parametrize("spec", _CHUNK_ACTIVATIONS, ids=[s[0] for s in _CHUNK_ACTIVATIONS])
+@torch.inference_mode()
+def test_activation_chunk_noncontiguous(spec, half: str, hidden: int, dtype: torch.dtype) -> None:
+    device = DEVICES[0]
+    _skip_unsupported_dtype(dtype, device)
+    _name, ref_fn, fn, layer_cls = spec
+    torch.manual_seed(0)
+    torch.set_default_device(device)
+    # (batch, seq, 2 * hidden), then chunk on the last dim. Both halves have
+    # stride(-1) == 1 and a row stride of 2 * hidden.
+    full = torch.randn(2, 5, 2 * hidden, dtype=dtype)
+    leading, trailing = full.chunk(2, dim=-1)
+    inp = leading if half == "leading" else trailing
+    assert not inp.is_contiguous()
+    assert inp.stride(-1) == 1
+
+    out = torch.empty(inp.shape, dtype=dtype, device=device)
+    fn(out, inp)
+    ref = ref_fn(inp)
+    _assert_activation_close(out, ref)
+    _assert_activation_close(layer_cls()(inp), ref)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_silu_and_mul_row_strided(dtype: torch.dtype) -> None:
+    device = DEVICES[0]
+    _skip_unsupported_dtype(dtype, device)
+    torch.manual_seed(0)
+    torch.set_default_device(device)
+    d = 32
+    # A prefix of a wider last dim is contiguous within the row but the row
+    # stride is the full width, not 2 * d.
+    wide = torch.randn(3, 6, 4 * d, dtype=dtype)
+    inp = wide[..., : 2 * d]
+    assert not inp.is_contiguous()
+    assert inp.stride(-1) == 1
+
+    out = torch.empty(*inp.shape[:-1], d, dtype=dtype, device=device)
+    activation.silu_and_mul(out, inp)
+    ref = silu_and_mul(inp)
+    _assert_reference(out, ref, exact=True)
+    _assert_reference(activation.layers.SiluAndMul()(inp), ref, exact=True)
+
+
+@pytest.mark.kernels_ci
+@torch.inference_mode()
+def test_chunked_activation_does_not_copy() -> None:
+    device = DEVICES[0]
+    if device not in ("mps",) and not str(device).startswith("cuda"):
+        pytest.skip("only CUDA and MPS index row-strided inputs natively")
+    torch.manual_seed(0)
+    torch.set_default_device(device)
+    full = torch.randn(2, 4, 64, dtype=torch.float32)
+    inp, _ = full.chunk(2, dim=-1)
+    copied = {"n": 0}
+    original = torch.Tensor.contiguous
+
+    def _counting_contiguous(self, *args, **kwargs):
+        copied["n"] += 1
+        return original(self, *args, **kwargs)
+
+    torch.Tensor.contiguous = _counting_contiguous
+    try:
+        out = activation.layers.Silu()(inp)
+    finally:
+        torch.Tensor.contiguous = original
+    assert copied["n"] == 0
+    _assert_activation_close(out, F.silu(inp))
+
+
+@pytest.mark.kernels_ci
+@torch.inference_mode()
+def test_activation_rejects_non_unit_last_stride() -> None:
+    device = DEVICES[0]
+    if device not in ("mps",) and not str(device).startswith("cuda"):
+        pytest.skip("XPU and CPU still require a contiguous input")
+    torch.manual_seed(0)
+    torch.set_default_device(device)
+    transposed = torch.randn(8, 16, dtype=torch.float32).t()
+    assert transposed.stride(-1) != 1
+    out = torch.empty(transposed.shape, dtype=transposed.dtype, device=device)
+    with pytest.raises(RuntimeError, match="last dimension"):
+        activation.gelu(out, transposed)
+    # The module copies layouts the kernel cannot index.
+    layer_out = activation.layers.Gelu()(transposed)
+    _assert_activation_close(layer_out, F.gelu(transposed))

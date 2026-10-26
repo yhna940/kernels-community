@@ -4,6 +4,64 @@ import torch.nn as nn
 from ._ops import ops
 
 
+def _supports_strided_rows(x: torch.Tensor) -> bool:
+    """Last dimension is contiguous and leading dims collapse to one row stride.
+
+    This is the layout of ``tensor.chunk(..., dim=-1)``. Fully arbitrary
+    strides (a transposed last dimension, or a gap that is not one row stride)
+    return False.
+    """
+    if x.ndim < 1:
+        return False
+    if x.size(-1) > 1 and x.stride(-1) != 1:
+        return False
+    if x.ndim == 1:
+        return True
+    inner = 1
+    row_stride = None
+    for i in range(x.ndim - 2, -1, -1):
+        size = x.size(i)
+        if size == 1:
+            continue
+        stride = x.stride(i)
+        if stride < 0:
+            return False
+        if row_stride is None:
+            row_stride = stride
+            inner = size
+            continue
+        if inner != 0 and row_stride > (2**63 - 1) // inner:
+            return False
+        if stride != row_stride * inner:
+            return False
+        if size > (2**63 - 1) // inner:
+            return False
+        inner *= size
+    # Metal indexes the row with a uint32 stride. CUDA uses int64.
+    if (
+        x.device.type == "mps"
+        and row_stride is not None
+        and row_stride > 0xFFFFFFFF
+    ):
+        return False
+    return True
+
+
+def _prepare_input(x: torch.Tensor) -> torch.Tensor:
+    """Pass through layouts the CUDA and Metal kernels index themselves.
+
+    Contiguous tensors stay as they are. On CUDA (including ROCm) and MPS, a
+    contiguous last dimension with a single row stride is also passed through.
+    Every other layout, and every other backend, is copied so the kernel sees
+    a contiguous tensor.
+    """
+    if x.is_contiguous():
+        return x
+    if x.device.type in ("cuda", "mps") and _supports_strided_rows(x):
+        return x
+    return x.contiguous()
+
+
 class SiluAndMul(nn.Module):
     """An activation function for SwiGLU.
 
@@ -17,8 +75,7 @@ class SiluAndMul(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
-        if not x.is_contiguous():
-            x = x.contiguous()
+        x = _prepare_input(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -38,9 +95,8 @@ class Silu(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
-        if not x.is_contiguous():
-            x = x.contiguous()
-        out = torch.empty_like(x)
+        x = _prepare_input(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.silu(out, x)
         return out
 
@@ -57,9 +113,8 @@ class Gelu(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
-        if not x.is_contiguous():
-            x = x.contiguous()
-        out = torch.empty_like(x)
+        x = _prepare_input(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.gelu(out, x)
         return out
 
@@ -76,9 +131,8 @@ class GeluTanh(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
-        if not x.is_contiguous():
-            x = x.contiguous()
-        out = torch.empty_like(x)
+        x = _prepare_input(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.gelu_tanh(out, x)
         return out
 
@@ -96,8 +150,7 @@ class MulAndSilu(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            x = x.contiguous()
+        x = _prepare_input(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -118,8 +171,7 @@ class GeluAndMul(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
-        if not x.is_contiguous():
-            x = x.contiguous()
+        x = _prepare_input(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -131,8 +183,7 @@ class GeluTanhAndMul(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
-        if not x.is_contiguous():
-            x = x.contiguous()
+        x = _prepare_input(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -159,8 +210,7 @@ class FatreluAndMul(nn.Module):
         self.threshold = threshold
 
     def forward(self, x: torch.Tensor):
-        if not x.is_contiguous():
-            x = x.contiguous()
+        x = _prepare_input(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -172,9 +222,8 @@ class FastGELU(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        out = torch.empty_like(x)
+        x = _prepare_input(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.gelu_fast(out, x)
         return out
 
@@ -183,9 +232,8 @@ class NewGELU(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        out = torch.empty_like(x)
+        x = _prepare_input(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.gelu_new(out, x)
         return out
 
@@ -194,8 +242,7 @@ class QuickGELU(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        out = torch.empty_like(x)
+        x = _prepare_input(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.gelu_quick(out, x)
         return out

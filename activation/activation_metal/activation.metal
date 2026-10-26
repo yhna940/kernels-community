@@ -144,10 +144,24 @@ inline float4 gelu_quick_f4(float4 x) {
     return x / (1.0f + metal::exp(-1.702f * x));
 }
 
+// Rebase input so packed indexing (token * packed width + column) addresses a
+// row-strided tensor. Contiguous launches pass that packed width, so the
+// rebase is zero and the vector path is unchanged. vec_ok is 0 when a float4
+// or half4 load would be misaligned; the scalar loop then covers one tile.
+template <typename T>
+inline device const T* activation_row(device const T* input, uint tok,
+                                       uint in_row_stride, uint packed_base) {
+    long delta = static_cast<long>(tok) * static_cast<long>(in_row_stride) -
+                 static_cast<long>(packed_base);
+    return input + delta;
+}
+
 kernel void silu_and_mul_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -157,9 +171,10 @@ kernel void silu_and_mul_f32(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx + 4]);
         float4 y0 = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
@@ -168,7 +183,7 @@ kernel void silu_and_mul_f32(
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = silu_f4(x0) * y0;
         *reinterpret_cast<device float4*>(&out[out_base + base_idx + 4]) = silu_f4(x1) * y1;
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 y = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = silu_f4(x) * y;
@@ -180,7 +195,7 @@ kernel void silu_and_mul_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = input[in_base + i];
             float yi = input[in_base + d + i];
             out[out_base + i] = silu_f(xi) * yi;
@@ -192,6 +207,8 @@ kernel void silu_and_mul_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -201,9 +218,10 @@ kernel void silu_and_mul_f16(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx + 4]));
         float4 y0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
@@ -212,7 +230,7 @@ kernel void silu_and_mul_f16(
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(silu_f4(x0) * y0);
         *reinterpret_cast<device half4*>(&out[out_base + base_idx + 4]) = half4(silu_f4(x1) * y1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 y = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(silu_f4(x) * y);
@@ -224,7 +242,7 @@ kernel void silu_and_mul_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = float(input[in_base + i]);
             float yi = float(input[in_base + d + i]);
             out[out_base + i] = half(silu_f(xi) * yi);
@@ -236,6 +254,8 @@ kernel void mul_and_silu_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -245,9 +265,10 @@ kernel void mul_and_silu_f32(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx + 4]);
         float4 y0 = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
@@ -256,7 +277,7 @@ kernel void mul_and_silu_f32(
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = x0 * silu_f4(y0);
         *reinterpret_cast<device float4*>(&out[out_base + base_idx + 4]) = x1 * silu_f4(y1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 y = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = x * silu_f4(y);
@@ -268,7 +289,7 @@ kernel void mul_and_silu_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = input[in_base + i];
             float yi = input[in_base + d + i];
             out[out_base + i] = xi * silu_f(yi);
@@ -280,6 +301,8 @@ kernel void mul_and_silu_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -289,9 +312,10 @@ kernel void mul_and_silu_f16(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx + 4]));
         float4 y0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
@@ -300,7 +324,7 @@ kernel void mul_and_silu_f16(
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(x0 * silu_f4(y0));
         *reinterpret_cast<device half4*>(&out[out_base + base_idx + 4]) = half4(x1 * silu_f4(y1));
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 y = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(x * silu_f4(y));
@@ -312,7 +336,7 @@ kernel void mul_and_silu_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = float(input[in_base + i]);
             float yi = float(input[in_base + d + i]);
             out[out_base + i] = half(xi * silu_f(yi));
@@ -324,6 +348,8 @@ kernel void gelu_and_mul_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -333,9 +359,10 @@ kernel void gelu_and_mul_f32(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx + 4]);
         float4 y0 = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
@@ -344,7 +371,7 @@ kernel void gelu_and_mul_f32(
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = gelu_f4(x0) * y0;
         *reinterpret_cast<device float4*>(&out[out_base + base_idx + 4]) = gelu_f4(x1) * y1;
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 y = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = gelu_f4(x) * y;
@@ -356,7 +383,7 @@ kernel void gelu_and_mul_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = input[in_base + i];
             float yi = input[in_base + d + i];
             out[out_base + i] = gelu_f(xi) * yi;
@@ -368,6 +395,8 @@ kernel void gelu_and_mul_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -377,9 +406,10 @@ kernel void gelu_and_mul_f16(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx + 4]));
         float4 y0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
@@ -388,7 +418,7 @@ kernel void gelu_and_mul_f16(
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(gelu_f4(x0) * y0);
         *reinterpret_cast<device half4*>(&out[out_base + base_idx + 4]) = half4(gelu_f4(x1) * y1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 y = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(gelu_f4(x) * y);
@@ -400,7 +430,7 @@ kernel void gelu_and_mul_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = float(input[in_base + i]);
             float yi = float(input[in_base + d + i]);
             out[out_base + i] = half(gelu_f(xi) * yi);
@@ -412,6 +442,8 @@ kernel void gelu_tanh_and_mul_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -421,9 +453,10 @@ kernel void gelu_tanh_and_mul_f32(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx + 4]);
         float4 y0 = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
@@ -432,7 +465,7 @@ kernel void gelu_tanh_and_mul_f32(
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = gelu_tanh_f4(x0) * y0;
         *reinterpret_cast<device float4*>(&out[out_base + base_idx + 4]) = gelu_tanh_f4(x1) * y1;
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 y = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = gelu_tanh_f4(x) * y;
@@ -444,7 +477,7 @@ kernel void gelu_tanh_and_mul_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = input[in_base + i];
             float yi = input[in_base + d + i];
             out[out_base + i] = gelu_tanh_f(xi) * yi;
@@ -456,6 +489,8 @@ kernel void gelu_tanh_and_mul_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -465,9 +500,10 @@ kernel void gelu_tanh_and_mul_f16(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx + 4]));
         float4 y0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
@@ -476,7 +512,7 @@ kernel void gelu_tanh_and_mul_f16(
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(gelu_tanh_f4(x0) * y0);
         *reinterpret_cast<device half4*>(&out[out_base + base_idx + 4]) = half4(gelu_tanh_f4(x1) * y1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 y = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(gelu_tanh_f4(x) * y);
@@ -488,7 +524,7 @@ kernel void gelu_tanh_and_mul_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = float(input[in_base + i]);
             float yi = float(input[in_base + d + i]);
             out[out_base + i] = half(gelu_tanh_f(xi) * yi);
@@ -500,7 +536,9 @@ kernel void fatrelu_and_mul_f32(
     device float*       out       [[buffer(0)]],
     device const float* input     [[buffer(1)]],
     constant uint&      d         [[buffer(2)]],
-    constant float&     threshold [[buffer(3)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
+    constant float&     threshold [[buffer(5)]],
     uint2 gid                     [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -510,9 +548,10 @@ kernel void fatrelu_and_mul_f32(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[in_base + base_idx + 4]);
         float4 y0 = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
@@ -521,7 +560,7 @@ kernel void fatrelu_and_mul_f32(
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = fatrelu_f4(x0, threshold) * y0;
         *reinterpret_cast<device float4*>(&out[out_base + base_idx + 4]) = fatrelu_f4(x1, threshold) * y1;
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[in_base + base_idx]);
         float4 y = *reinterpret_cast<device const float4*>(&input[in_base + d + base_idx]);
         *reinterpret_cast<device float4*>(&out[out_base + base_idx]) = fatrelu_f4(x, threshold) * y;
@@ -533,7 +572,7 @@ kernel void fatrelu_and_mul_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = input[in_base + i];
             float yi = input[in_base + d + i];
             out[out_base + i] = fatrelu_f(xi, threshold) * yi;
@@ -545,7 +584,9 @@ kernel void fatrelu_and_mul_f16(
     device half*        out       [[buffer(0)]],
     device const half*  input     [[buffer(1)]],
     constant uint&      d         [[buffer(2)]],
-    constant float&     threshold [[buffer(3)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
+    constant float&     threshold [[buffer(5)]],
     uint2 gid                     [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -555,9 +596,10 @@ kernel void fatrelu_and_mul_f16(
     if (base_idx >= d) return;
 
     uint in_base = tok * 2u * d;
+    input = activation_row(input, tok, in_row_stride, in_base);
     uint out_base = tok * d;
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx + 4]));
         float4 y0 = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
@@ -566,7 +608,7 @@ kernel void fatrelu_and_mul_f16(
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(fatrelu_f4(x0, threshold) * y0);
         *reinterpret_cast<device half4*>(&out[out_base + base_idx + 4]) = half4(fatrelu_f4(x1, threshold) * y1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[in_base + base_idx]));
         float4 y = float4(*reinterpret_cast<device const half4*>(&input[in_base + d + base_idx]));
         *reinterpret_cast<device half4*>(&out[out_base + base_idx]) = half4(fatrelu_f4(x, threshold) * y);
@@ -578,7 +620,7 @@ kernel void fatrelu_and_mul_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             float xi = float(input[in_base + i]);
             float yi = float(input[in_base + d + i]);
             out[out_base + i] = half(fatrelu_f(xi, threshold) * yi);
@@ -590,6 +632,8 @@ kernel void silu_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -599,14 +643,15 @@ kernel void silu_f32(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[base + base_idx + 4]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = silu_f4(x0);
         *reinterpret_cast<device float4*>(&out[base + base_idx + 4]) = silu_f4(x1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = silu_f4(x);
         for (uint i = base_idx + 4; i < d; i++) {
@@ -614,7 +659,7 @@ kernel void silu_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = silu_f(input[base + i]);
         }
     }
@@ -624,6 +669,8 @@ kernel void silu_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -633,14 +680,15 @@ kernel void silu_f16(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx + 4]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(silu_f4(x0));
         *reinterpret_cast<device half4*>(&out[base + base_idx + 4]) = half4(silu_f4(x1));
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(silu_f4(x));
         for (uint i = base_idx + 4; i < d; i++) {
@@ -648,7 +696,7 @@ kernel void silu_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = half(silu_f(float(input[base + i])));
         }
     }
@@ -658,6 +706,8 @@ kernel void gelu_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -667,14 +717,15 @@ kernel void gelu_f32(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[base + base_idx + 4]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_f4(x0);
         *reinterpret_cast<device float4*>(&out[base + base_idx + 4]) = gelu_f4(x1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_f4(x);
         for (uint i = base_idx + 4; i < d; i++) {
@@ -682,7 +733,7 @@ kernel void gelu_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = gelu_f(input[base + i]);
         }
     }
@@ -692,6 +743,8 @@ kernel void gelu_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -701,14 +754,15 @@ kernel void gelu_f16(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx + 4]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_f4(x0));
         *reinterpret_cast<device half4*>(&out[base + base_idx + 4]) = half4(gelu_f4(x1));
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_f4(x));
         for (uint i = base_idx + 4; i < d; i++) {
@@ -716,7 +770,7 @@ kernel void gelu_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = half(gelu_f(float(input[base + i])));
         }
     }
@@ -726,6 +780,8 @@ kernel void gelu_tanh_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -735,14 +791,15 @@ kernel void gelu_tanh_f32(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[base + base_idx + 4]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_tanh_f4(x0);
         *reinterpret_cast<device float4*>(&out[base + base_idx + 4]) = gelu_tanh_f4(x1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_tanh_f4(x);
         for (uint i = base_idx + 4; i < d; i++) {
@@ -750,7 +807,7 @@ kernel void gelu_tanh_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = gelu_tanh_f(input[base + i]);
         }
     }
@@ -760,6 +817,8 @@ kernel void gelu_tanh_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -769,14 +828,15 @@ kernel void gelu_tanh_f16(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx + 4]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_tanh_f4(x0));
         *reinterpret_cast<device half4*>(&out[base + base_idx + 4]) = half4(gelu_tanh_f4(x1));
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_tanh_f4(x));
         for (uint i = base_idx + 4; i < d; i++) {
@@ -784,7 +844,7 @@ kernel void gelu_tanh_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = half(gelu_tanh_f(float(input[base + i])));
         }
     }
@@ -794,6 +854,8 @@ kernel void gelu_new_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -803,14 +865,15 @@ kernel void gelu_new_f32(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[base + base_idx + 4]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_new_f4(x0);
         *reinterpret_cast<device float4*>(&out[base + base_idx + 4]) = gelu_new_f4(x1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_new_f4(x);
         for (uint i = base_idx + 4; i < d; i++) {
@@ -818,7 +881,7 @@ kernel void gelu_new_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = gelu_new_f(input[base + i]);
         }
     }
@@ -828,6 +891,8 @@ kernel void gelu_new_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -837,14 +902,15 @@ kernel void gelu_new_f16(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx + 4]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_new_f4(x0));
         *reinterpret_cast<device half4*>(&out[base + base_idx + 4]) = half4(gelu_new_f4(x1));
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_new_f4(x));
         for (uint i = base_idx + 4; i < d; i++) {
@@ -852,7 +918,7 @@ kernel void gelu_new_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = half(gelu_new_f(float(input[base + i])));
         }
     }
@@ -862,6 +928,8 @@ kernel void gelu_fast_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -871,14 +939,15 @@ kernel void gelu_fast_f32(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[base + base_idx + 4]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_fast_f4(x0);
         *reinterpret_cast<device float4*>(&out[base + base_idx + 4]) = gelu_fast_f4(x1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_fast_f4(x);
         for (uint i = base_idx + 4; i < d; i++) {
@@ -886,7 +955,7 @@ kernel void gelu_fast_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = gelu_fast_f(input[base + i]);
         }
     }
@@ -896,6 +965,8 @@ kernel void gelu_fast_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -905,14 +976,15 @@ kernel void gelu_fast_f16(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx + 4]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_fast_f4(x0));
         *reinterpret_cast<device half4*>(&out[base + base_idx + 4]) = half4(gelu_fast_f4(x1));
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_fast_f4(x));
         for (uint i = base_idx + 4; i < d; i++) {
@@ -920,7 +992,7 @@ kernel void gelu_fast_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = half(gelu_fast_f(float(input[base + i])));
         }
     }
@@ -930,6 +1002,8 @@ kernel void gelu_quick_f32(
     device float*       out   [[buffer(0)]],
     device const float* input [[buffer(1)]],
     constant uint&      d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                 [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -939,14 +1013,15 @@ kernel void gelu_quick_f32(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         float4 x1 = *reinterpret_cast<device const float4*>(&input[base + base_idx + 4]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_quick_f4(x0);
         *reinterpret_cast<device float4*>(&out[base + base_idx + 4]) = gelu_quick_f4(x1);
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = *reinterpret_cast<device const float4*>(&input[base + base_idx]);
         *reinterpret_cast<device float4*>(&out[base + base_idx]) = gelu_quick_f4(x);
         for (uint i = base_idx + 4; i < d; i++) {
@@ -954,7 +1029,7 @@ kernel void gelu_quick_f32(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = gelu_quick_f(input[base + i]);
         }
     }
@@ -964,6 +1039,8 @@ kernel void gelu_quick_f16(
     device half*       out   [[buffer(0)]],
     device const half* input [[buffer(1)]],
     constant uint&     d     [[buffer(2)]],
+    constant uint&      in_row_stride [[buffer(3)]],
+    constant uint&      vec_ok        [[buffer(4)]],
     uint2 gid                [[thread_position_in_grid]]
 ) {
     uint idx8 = gid.x;
@@ -973,14 +1050,15 @@ kernel void gelu_quick_f16(
     if (base_idx >= d) return;
 
     uint base = tok * d;
+    input = activation_row(input, tok, in_row_stride, base);
 
-    if (base_idx + 8 <= d) {
+    if (vec_ok && base_idx + 8 <= d) {
         float4 x0 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         float4 x1 = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx + 4]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_quick_f4(x0));
         *reinterpret_cast<device half4*>(&out[base + base_idx + 4]) = half4(gelu_quick_f4(x1));
     }
-    else if (base_idx + 4 <= d) {
+    else if (vec_ok && base_idx + 4 <= d) {
         float4 x = float4(*reinterpret_cast<device const half4*>(&input[base + base_idx]));
         *reinterpret_cast<device half4*>(&out[base + base_idx]) = half4(gelu_quick_f4(x));
         for (uint i = base_idx + 4; i < d; i++) {
@@ -988,7 +1066,7 @@ kernel void gelu_quick_f16(
         }
     }
     else {
-        for (uint i = base_idx; i < d; i++) {
+        for (uint i = base_idx; i < metal::min(base_idx + 8u, d); i++) {
             out[base + i] = half(gelu_quick_f(float(input[base + i])));
         }
     }
